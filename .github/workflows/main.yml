@@ -1,124 +1,81 @@
-name: RDP with Auto-Restart
+name: RDP
 
 on:
   workflow_dispatch:
   schedule:
-    # اجرای خودکار هر 5 ساعت و 30 دقیقه
+    # اجرای خودکار هر 5 ساعت
     - cron: '0 */5 * * *'
-    - cron: '30 */5 * * *'
-
-env:
-  RDP_USERNAME: "RDP"
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 330  # 5.5 ساعت (کمتر از محدودیت 6 ساعته GitHub)
+    # قطع شدن خودکار پس از 5 ساعت و 40 دقیقه
+    timeout-minutes: 340
 
     steps:
-      - name: Cancel Previous Runs
-        uses: styfle/cancel-workflow-action@0.12.1
-        with:
-          access_token: ${{ secrets.GITHUB_TOKEN }}
-          all_but_latest: true
-
       - name: Configure Core RDP Settings
         run: |
-          # فعال کردن Remote Desktop
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                           -Name "fDenyTSConnections" -Value 0 -Force
-          
-          # غیرفعال کردن Network Level Authentication (برای سازگاری بیشتر)
+                             -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "UserAuthentication" -Value 0 -Force
-          
-          # تنظیم Security Layer
+                             -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                           -Name "SecurityLayer" -Value 0 -Force
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          # حذف قانون قبلی فایروال (در صورت وجود)
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
           
-          # ایجاد قانون جدید برای فایروال
+          # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # راه‌اندازی مجدد سرویس Remote Desktop
-          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Secure Password
         run: |
-          # تعریف مجموعه کاراکترها برای پسورد
+          Add-Type -AssemblyName System.Security
           $charSet = @{
               Upper   = [char[]](65..90)      # A-Z
               Lower   = [char[]](97..122)     # a-z
               Number  = [char[]](48..57)      # 0-9
               Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # کاراکترهای خاص
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
           }
-          
-          # تولید پسورد تصادفی
           $rawPassword = @()
           $rawPassword += $charSet.Upper | Get-Random -Count 4
           $rawPassword += $charSet.Lower | Get-Random -Count 4
           $rawPassword += $charSet.Number | Get-Random -Count 4
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
-          
-          # تبدیل به Secure String
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          # حذف کاربر قبلی (در صورت وجود)
-          $existingUser = Get-LocalUser -Name "$env:RDP_USERNAME" -ErrorAction SilentlyContinue
-          if ($existingUser) {
-              Remove-LocalUser -Name "$env:RDP_USERNAME"
-          }
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
           
-          # ایجاد کاربر جدید
-          New-LocalUser -Name "$env:RDP_USERNAME" -Password $securePass -AccountNeverExpires
-          
-          # اضافه کردن کاربر به گروه‌های مورد نیاز
-          Add-LocalGroupMember -Group "Administrators" -Member "$env:RDP_USERNAME"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "$env:RDP_USERNAME"
-          
-          # ذخیره اطلاعات کاربری در Environment Variables
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          echo "RDP_CREDS=User: $env:RDP_USERNAME | Password: $password" >> $env:GITHUB_ENV
-          
-          # تأیید ایجاد کاربر
-          if (-not (Get-LocalUser -Name "$env:RDP_USERNAME")) {
+          if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
           }
 
       - name: Install Tailscale
         run: |
-          # دانلود Tailscale
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          
-          # نصب Tailscale
-          Start-Process msiexec.exe `
-            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
-            -Wait `
-            -NoNewWindow
-          
-          # حذف فایل نصب‌کننده
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
-          
-          # انتظار برای کامل شدن فرآیند نصب
-          Start-Sleep -Seconds 10
 
       - name: Establish Tailscale Connection
         run: |
-          # اتصال به Tailscale
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          # انتظار برای دریافت IP از Tailscale
+          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
@@ -127,60 +84,35 @@ jobs:
               $retries++
           }
           
-          # بررسی موفقیت‌آمیز بودن اتصال
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
-          
-          # ذخیره IP در Environment Variables
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
+      
       - name: Verify RDP Accessibility
         run: |
-          # نمایش اطلاعات اتصال
-          Write-Host "=== RDP CONNECTION DETAILS ==="
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "$env:RDP_CREDS"
-          Write-Host "=============================="
           
-          # آزمایش اتصال TCP به پورت RDP
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-          
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Warning "TCP connection test failed initially. Retrying in 30 seconds..."
-              Start-Sleep -Seconds 30
-              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-              
-              if (-not $testResult.TcpTestSucceeded) {
-                  Write-Error "TCP connection to RDP port 3389 failed after retry"
-                  exit 1
-              }
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
           }
-          
-          Write-Host "✅ TCP connectivity successful!"
+          Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection Until Timeout
+      - name: Maintain Connection
         run: |
-          Write-Host "`n🚀 RDP SESSION ACTIVE"
-          Write-Host "========================"
+          Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: $env:RDP_USERNAME"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "========================`n"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
           
-          Write-Host "⏰ This session will automatically restart every 5.5 hours"
-          Write-Host "📋 Next auto-restart scheduled via GitHub Actions cron"
-          Write-Host "🔄 Manual restart: Trigger 'RDP with Auto-Restart' workflow"
-          
-          # حلقه نگه‌دارنده با شمارش معکوس
-          $totalSeconds = 330 * 60  # 5.5 ساعت به ثانیه
-          $interval = 300  # نمایش وضعیت هر 5 دقیقه
-          
-          for ($i = 0; $i -lt $totalSeconds; $i += $interval) {
-              $remainingMinutes = [math]::Ceiling(($totalSeconds - $i) / 60)
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP active - $remainingMinutes minutes remaining until auto-restart"
-              Start-Sleep -Seconds $interval
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
           }
-          
-          Write-Host "⏳ Session timeout reached. Workflow will auto-restart via cron schedule."
+
