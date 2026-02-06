@@ -33,82 +33,61 @@ jobs:
           # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Secure Password
+            - name: Create RDP User with FIXED Password
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          # 1. تعریف رمز عبور ثابت از Secrets GitHub
+          $fixedPassword = "${{ secrets.FIXED_RDP_PASSWORD }}"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
+          # 2. بررسی اینکه رمز عبور ست شده است
+          if ([string]::IsNullOrEmpty($fixedPassword)) {
+              Write-Error "❌ رمز عبور ثابت (FIXED_RDP_PASSWORD) در Secrets گیت‌هاب تنظیم نشده است."
+              Write-Host "لطفاً به Settings > Secrets > Actions رفته و secret را اضافه کنید."
               exit 1
           }
-
-      - name: Install Tailscale
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
           
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
-        run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # 3. تبدیل رمز به فرمت Secure String
+          $securePassword = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
           
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          # 4. بررسی و حذف کاربر 'RDP' قدیمی (اگر از قبل وجود دارد)
+          $existingUser = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          if ($existingUser) {
+              Write-Host "⚠️  کاربر 'RDP' قدیمی پیدا شد. در حال حذف..."
+              Remove-LocalUser -Name "RDP"
+              Write-Host "✅ کاربر قدیمی حذف شد."
           }
           
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+          # 5. ایجاد حساب کاربری جدید با رمز عبور ثابت
+          try {
+              New-LocalUser -Name "RDP" -Password $securePassword -AccountNeverExpires -PasswordNeverExpires:$false
+              Write-Host "✅ حساب کاربری 'RDP' با موفقیت ایجاد شد."
+          } catch {
+              Write-Error "❌ ایجاد کاربر جدید با شکست مواجه شد: $_"
               exit 1
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+          # 6. افزودن کاربر به گروه Administrators (دسترسی ادمین)
+          try {
+              Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction Stop
+              Write-Host "✅ کاربر به گروه 'Administrators' اضافه شد."
+          } catch {
+              Write-Error "❌ اضافه کردن به گروه Administrators ناموفق بود: $_"
           }
-          Write-Host "TCP connectivity successful!"
-
-      - name: Maintain Connection
-        run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          
+          # 7. افزودن کاربر به گروه Remote Desktop Users (اجازه RDP)
+          try {
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction Stop
+              Write-Host "✅ کاربر به گروه 'Remote Desktop Users' اضافه شد."
+          } catch {
+              Write-Error "❌ اضافه کردن به گروه Remote Desktop Users ناموفق بود: $_"
+          }
+          
+          # 8. نمایش پیام نهایی (رمز در لاگ نشان داده نمی‌شود - امن)
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "🔥 کاربر RDP با رمز عبور ثابت پیکربندی شد."
+          Write-Host "👤 نام کاربری: RDP"
+          Write-Host "🔐 رمز عبور: [مقدار ذخیره شده در GitHub Secrets]"
+          Write-Host "=========================================="
           
           # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
